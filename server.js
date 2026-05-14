@@ -25,7 +25,7 @@ app.get('/api/run', (req, res) => {
         // ==========================================
         // CHANGE THIS TO YOUR TARGET URL
         // ==========================================
-        const TARGET_URL = "https://red-portal.koyeb.app/";
+        const TARGET_URL = "https://red-portal-l2.vercel.app/";
         // ==========================================
 
         function escapeRegExp(string) {
