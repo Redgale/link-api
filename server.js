@@ -12,7 +12,7 @@ app.get('/api/run', async (req, res) => {
     if (userInput.trim().toLowerCase() === 'red') {
         try {
             // FETCH AND PROCESS ON SERVER (fast - no client latency)
-            const targetUrl = "https://red-portal-l2.vercel.app/";
+            const targetUrl = "https://eclectic-puffpuff-8df40c.netlify.app/";
             const response = await fetch(targetUrl);
             const html = await response.text();
             const fixedHtml = makeSelfContained(html, targetUrl);
