@@ -119,7 +119,7 @@ app.get('/api/run', (req, res) => {
     if (cache.html) {
       res.set('Content-Type', 'text/html; charset=utf-8');
       res.set('Cache-Control', 'no-store');
-      return res.send(buildLauncher(JSON.stringify(cache.html)));
+      return res.send(buildLauncher(JSON.stringify(cache.html).replace(/<\//g, '<\\/')));
     }
     return res.send(
       `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
@@ -139,7 +139,7 @@ app.get('/api/run', (req, res) => {
 const i=${JSON.stringify(userInput)};
 document.getElementById('t').textContent='Ran at '+new Date().toLocaleTimeString();
 if(i.startsWith('alert '))alert(i.slice(6));
-</script></body></html>`);
+<\/script></body></html>`);
 });
 
 app.get('/api/status', (_req, res) => {
