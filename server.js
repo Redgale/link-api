@@ -67,12 +67,13 @@ setInterval(fetchSite, CACHE_TTL_MS);
 // Tiny page — no embedded data. On click:
 //   1. Opens about:blank synchronously (must be inside click handler)
 //   2. Fetches raw HTML from /api/html (launcher tab → server, NOT the new tab)
-//   3. document.write()s it straight into the about:blank tab
-//   4. Drops all references and closes itself
+//   3. Wraps it in a Blob URL and navigates the new tab to it
+//   4. Revokes the Blob URL after a short delay and closes itself
 //
-// NOTE: Chrome's Sources panel will list the API URL as the document's
-// origin — this is security bookkeeping, not a network connection.
-// The about:blank tab makes zero HTTP requests to this server.
+// The Blob URL gives the new tab an opaque (null) origin, completely
+// severing any association with localhost:3000 in IndexedDB, localStorage,
+// and the address bar — unlike document.write() into about:blank which
+// inherits the opener's origin.
 const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -122,11 +123,23 @@ document.getElementById('btn').addEventListener('click', function () {
       return r.text();
     })
     .then(function (html) {
-      // Write raw HTML directly into the about:blank tab
-      w.document.open();
-      w.document.write(html);
-      w.document.close();
-      w = null; // sever the reference — launcher can no longer touch the tab
+      // Wrap HTML in a Blob and navigate the new tab to the blob URL.
+      // The blob document gets an opaque (null) origin — no connection to
+      // localhost:3000 in IndexedDB, localStorage, or the address bar.
+      var blob = new Blob([html], { type: 'text/html' });
+      var url  = URL.createObjectURL(blob);
+
+      w.location.href = url;
+
+      // Sever the opener reference so the new tab cannot reach back
+      w.opener = null;
+
+      // Revoke the object URL after the browser has had time to load it.
+      // The document is already in memory by this point; revoking just
+      // removes the URL handle — it does not unload the page.
+      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+
+      w = null;
       window.close();
     })
     .catch(function (err) {
@@ -177,7 +190,7 @@ if(i.startsWith('alert '))alert(i.slice(6));
 </script></body></html>`);
 });
 
-// Raw cached HTML — requested only by the launcher tab's fetch(), never by about:blank
+// Raw cached HTML — requested only by the launcher tab's fetch(), never by the blob tab
 app.get('/api/html', (req, res) => {
   if (!cache.html) return res.status(503).send('<h1>Cache warming — try again shortly</h1>');
   res.set('Content-Type', 'text/html; charset=utf-8');
