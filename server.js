@@ -67,13 +67,8 @@ setInterval(fetchSite, CACHE_TTL_MS);
 // Tiny page — no embedded data. On click:
 //   1. Opens about:blank synchronously (must be inside click handler)
 //   2. Fetches raw HTML from /api/html (launcher tab → server, NOT the new tab)
-//   3. Wraps it in a Blob URL and navigates the new tab to it
-//   4. Revokes the Blob URL after a short delay and closes itself
-//
-// The Blob URL gives the new tab an opaque (null) origin, completely
-// severing any association with localhost:3000 in IndexedDB, localStorage,
-// and the address bar — unlike document.write() into about:blank which
-// inherits the opener's origin.
+//   3. Navigates the new tab to a neutral relay domain
+//   4. Passes the HTML via postMessage and closes itself
 const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -117,40 +112,36 @@ document.getElementById('btn').addEventListener('click', function () {
   }
 
   // Fetch raw HTML from server (this request comes from the LAUNCHER tab, not about:blank)
+  var RELAY = 'https://your-neutral-domain.vercel.app/relay.html';
+
   fetch('/api/html')
-    .then(function (r) {
+    .then(function(r) {
       if (!r.ok) throw new Error('Cache not ready (' + r.status + ')');
       return r.text();
     })
-    .then(function (html) {
-      // Wrap HTML in a Blob and navigate the new tab to the blob URL.
-      // The blob document gets an opaque (null) origin — no connection to
-      // localhost:3000 in IndexedDB, localStorage, or the address bar.
-      var blob = new Blob([html], { type: 'text/html' });
-      var url  = URL.createObjectURL(blob);
+    .then(function(html) {
+      // Navigate the new tab to the relay page on the neutral domain
+      w.location.href = RELAY;
 
-      w.location.href = url;
-
-      // Sever the opener reference so the new tab cannot reach back
-      w.opener = null;
-
-      // Revoke the object URL after the browser has had time to load it.
-      // The document is already in memory by this point; revoking just
-      // removes the URL handle — it does not unload the page.
-      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
-
-      w = null;
-      window.close();
+      // Wait for the relay page to load, then hand off the HTML via postMessage.
+      // The relay renders it — the tab's origin is now the neutral domain, not koyeb.
+      var interval = setInterval(function() {
+        try {
+          w.postMessage(html, RELAY);
+          clearInterval(interval);
+          
+          // Sever reference and close launcher only AFTER message succeeds
+          w.opener = null;
+          w = null;
+          window.close();
+        } catch(e) { /* still loading, retry */ }
+      }, 100);
     })
-    .catch(function (err) {
-      if (w) {
-        w.document.open();
-        w.document.write('<h2 style="font-family:sans-serif;padding:2rem">Failed: ' + err.message + '</h2>');
-        w.document.close();
-        w = null;
-      }
+    .catch(function(err) {
+      if (w) { w.close(); w = null; }
       btn.disabled = false;
       btn.textContent = 'Open ↗';
+      alert('Failed: ' + err.message);
     });
 });
 </script>
@@ -190,7 +181,7 @@ if(i.startsWith('alert '))alert(i.slice(6));
 </script></body></html>`);
 });
 
-// Raw cached HTML — requested only by the launcher tab's fetch(), never by the blob tab
+// Raw cached HTML — requested only by the launcher tab's fetch(), never by the new tab
 app.get('/api/html', (req, res) => {
   if (!cache.html) return res.status(503).send('<h1>Cache warming — try again shortly</h1>');
   res.set('Content-Type', 'text/html; charset=utf-8');
