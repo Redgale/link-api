@@ -13,11 +13,66 @@ const escapeHTML = (str) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
   );
 
-// Tiny launcher — no embedded data, loads in milliseconds.
-// On click: opens about:blank SYNCHRONOUSLY (inside the click handler,
-// so the browser never sees it as a popup), then fetches the HTML and
-// writes it into the already-open window. The about:blank tab never
-// makes any request to this server — only the launcher tab does.
+function processHtml(html) {
+  // 1. Inject base tag so relative assets resolve to the origin site
+  html = html.replace(/<head[^>]*>/i, (m) => `${m}<base href="${TARGET_URL}">`);
+
+  // 2. Strip allow-same-origin from any sandbox that also has allow-scripts.
+  //    This combo lets iframes escape sandboxing — remove it at the source.
+  html = html.replace(/\bsandbox=(["'])(.*?)\1/gi, (match, q, attrs) => {
+    if (/allow-scripts/i.test(attrs) && /allow-same-origin/i.test(attrs)) {
+      attrs = attrs.replace(/\ballow-same-origin\b\s*/gi, '').trim();
+      return `sandbox=${q}${attrs}${q}`;
+    }
+    return match;
+  });
+
+  return html;
+}
+
+let cache = {
+  html: null,
+  fetchedAt: 0,
+  fetching: false,
+};
+
+async function fetchSite() {
+  if (cache.fetching) return;
+  cache.fetching = true;
+  console.log('[cache] fetching', TARGET_URL);
+  try {
+    const res = await fetch(TARGET_URL);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = processHtml(await res.text());
+    cache.html = html;
+    cache.fetchedAt = Date.now();
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ html, fetchedAt: cache.fetchedAt }));
+    console.log(`[cache] updated — ${(Buffer.byteLength(html) / 1024).toFixed(1)} KB`);
+  } catch (err) {
+    console.error('[cache] fetch failed:', err.message);
+  } finally {
+    cache.fetching = false;
+  }
+}
+
+if (fs.existsSync(CACHE_FILE)) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    cache.html = saved.html;
+    cache.fetchedAt = saved.fetchedAt;
+    console.log(`[cache] loaded from disk — age ${((Date.now() - saved.fetchedAt) / 60000).toFixed(1)} min`);
+  } catch { /* corrupt, will re-fetch */ }
+}
+
+if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
+  fetchSite();
+} else {
+  const msUntilExpiry = CACHE_TTL_MS - (Date.now() - cache.fetchedAt);
+  setTimeout(() => { fetchSite(); setInterval(fetchSite, CACHE_TTL_MS); }, msUntilExpiry);
+}
+setInterval(fetchSite, CACHE_TTL_MS);
+
+// Tiny launcher page — no embedded data, <1KB
 const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -50,41 +105,48 @@ document.getElementById('btn').addEventListener('click', function () {
   btn.disabled = true;
   btn.textContent = 'Loading…';
 
-  // 1. Open about:blank SYNCHRONOUSLY — must happen inside the click
-  //    handler before any async work, otherwise the browser blocks it
-  //    as a popup. The tab opens instantly as a blank page.
+  // Step 1 — open a blank tab SYNCHRONOUSLY inside the click handler.
+  // This is the only moment the browser trusts us enough to allow window.open.
   var w = window.open('about:blank', '_blank');
 
   if (!w) {
-    // Popup was blocked despite the click handler — tell the user
     btn.disabled = false;
     btn.textContent = 'Open ↗';
     alert('Popup blocked — please allow popups for this page and try again.');
     return;
   }
 
-  // 2. Fetch the cached HTML from the server (launcher tab → server).
-  //    The about:blank tab makes zero requests of its own.
+  // Step 2 — fetch the cached HTML. The about:blank tab sits open and idle
+  // while this happens; it makes zero network requests of its own.
   fetch('/api/html')
-    .then(function(r) {
-      if (!r.ok) throw new Error('Cache not ready');
+    .then(function (r) {
+      if (!r.ok) throw new Error('Cache not ready (' + r.status + ')');
       return r.text();
     })
-    .then(function(html) {
-      // 3. Write into the already-open window. document.write() on a
-      //    window we own is always allowed, even after an await/then.
-      w.document.open();
-      w.document.write(html);
-      w.document.close();
-      w = null; // drop reference — launcher holds nothing after this
+    .then(function (html) {
+      // Step 3 — build a blob URL from the HTML and navigate the already-open
+      // tab to it. This is a real navigation: the tab gets its own opaque
+      // origin, no document.write inheritance, no API URL in Sources.
+      var blob = new Blob([html], { type: 'text/html' });
+      var url = URL.createObjectURL(blob);
 
-      // Close the launcher tab (works when opened programmatically)
-      window.close();
+      // Navigate the blank tab — not document.write, a proper location change.
+      // After this the opener has no influence on that tab's document.
+      w.location.href = url;
+      w = null; // drop reference entirely
+
+      // Revoke the blob URL after a short delay — the tab has navigated to it
+      // and no longer needs the object URL handle
+      setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+
+      window.close(); // close the launcher tab
     })
-    .catch(function(err) {
-      w.document.write('<h2 style="font-family:sans-serif;padding:2rem">Failed: ' + err.message + '</h2>');
-      w.document.close();
-      w = null;
+    .catch(function (err) {
+      if (w) {
+        w.document.write('<h2 style="font-family:sans-serif;padding:2rem">Failed: ' + err.message + '</h2>');
+        w.document.close();
+        w = null;
+      }
       btn.disabled = false;
       btn.textContent = 'Open ↗';
     });
@@ -93,54 +155,8 @@ document.getElementById('btn').addEventListener('click', function () {
 </body>
 </html>`;
 
-let cache = {
-  html: null,
-  fetchedAt: 0,
-  fetching: false,
-};
-
-async function fetchSite() {
-  if (cache.fetching) return;
-  cache.fetching = true;
-  console.log('[cache] fetching', TARGET_URL);
-  try {
-    const res = await fetch(TARGET_URL);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    let html = await res.text();
-    html = html.replace(/<head[^>]*>/i, (m) => `${m}<base href="${TARGET_URL}">`);
-    cache.html = html;
-    cache.fetchedAt = Date.now();
-    fs.writeFileSync(CACHE_FILE, JSON.stringify({ html, fetchedAt: cache.fetchedAt }));
-    console.log(`[cache] updated — ${(Buffer.byteLength(html) / 1024).toFixed(1)} KB`);
-  } catch (err) {
-    console.error('[cache] fetch failed:', err.message);
-  } finally {
-    cache.fetching = false;
-  }
-}
-
-// Warm from disk on startup
-if (fs.existsSync(CACHE_FILE)) {
-  try {
-    const saved = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    cache.html = saved.html;
-    cache.fetchedAt = saved.fetchedAt;
-    const ageMin = ((Date.now() - saved.fetchedAt) / 60000).toFixed(1);
-    console.log(`[cache] loaded from disk — age ${ageMin} min`);
-  } catch { /* corrupt, will re-fetch */ }
-}
-
-if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
-  fetchSite();
-} else {
-  const msUntilExpiry = CACHE_TTL_MS - (Date.now() - cache.fetchedAt);
-  setTimeout(() => { fetchSite(); setInterval(fetchSite, CACHE_TTL_MS); }, msUntilExpiry);
-}
-setInterval(fetchSite, CACHE_TTL_MS);
-
 // ---------- Routes ----------
 
-// Shows the launcher button — tiny, loads instantly
 app.get('/api/run', (req, res) => {
   const userInput = req.query.text;
   if (!userInput) return res.status(400).send('<h1>No text provided</h1>');
@@ -172,9 +188,9 @@ if(i.startsWith('alert '))alert(i.slice(6));
 </script></body></html>`);
 });
 
-// Serves raw cached HTML — only ever called by the launcher tab, never by about:blank
+// Raw cached HTML — fetched by the launcher tab only, never by the blob tab
 app.get('/api/html', (req, res) => {
-  if (!cache.html) return res.status(503).send('<h1>Cache warming, try again in a moment</h1>');
+  if (!cache.html) return res.status(503).send('<h1>Cache warming — try again shortly</h1>');
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.set('Cache-Control', 'no-store');
   res.send(cache.html);
