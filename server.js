@@ -13,8 +13,10 @@ const escapeHTML = (str) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
   );
 
-// One-click launcher page — auto-focused so Enter/Space opens the blob immediately.
-// window.open() inside a click handler is always allowed by browsers.
+// HTML is base64-encoded to safely embed in the launcher script.
+// The launcher decodes it client-side and writes it into a new about:blank tab.
+// Once w.document.close() is called the new tab is fully self-contained —
+// no src, no origin, no connection back to this server, ever.
 const makeLauncher = (b64) => `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -31,21 +33,36 @@ const makeLauncher = (b64) => `<!DOCTYPE html>
   }
   button:hover,button:focus{background:#252525;border-color:#555}
   button:active{transform:scale(.97)}
+  kbd{color:#888;font-family:inherit}
   p{color:#555;font-size:13px;margin-top:14px;text-align:center}
 </style>
 </head>
 <body>
 <div style="text-align:center">
   <button id="btn" autofocus>Open ↗</button>
-  <p>Press <kbd style="color:#888">Enter</kbd> or click to continue</p>
+  <p>Press <kbd>Enter</kbd> or click to continue</p>
 </div>
 <script>
-const b64=${JSON.stringify(b64)};
-document.getElementById('btn').addEventListener('click',function(){
-  const a=new Uint8Array(atob(b64).split('').map(c=>c.charCodeAt(0)));
-  const url=URL.createObjectURL(new Blob([a],{type:'text/html'}));
-  window.open(url,'_blank');
-  // Close this launcher tab if the browser allows it
+document.getElementById('btn').addEventListener('click', function () {
+  // Decode the pre-cached HTML entirely on the client
+  var html = new TextDecoder().decode(
+    new Uint8Array(atob(${JSON.stringify(b64)}).split('').map(function(c){return c.charCodeAt(0);}))
+  );
+
+  // Open a blank tab — allowed because we're inside a click handler
+  var w = window.open('about:blank', '_blank');
+
+  // Write the full HTML into it and seal the document.
+  // After close(), the tab owns its own document; no src, no origin,
+  // no reference back to this server. The network connection is gone.
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+
+  // Drop our reference so this launcher tab holds nothing
+  w = null;
+
+  // Close the launcher tab (works when opened programmatically)
   window.close();
 });
 </script>
@@ -79,7 +96,7 @@ async function fetchSite() {
   }
 }
 
-// Warm from disk on startup
+// Warm from disk on startup — no fetch needed if cache is fresh
 if (fs.existsSync(CACHE_FILE)) {
   try {
     const saved = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
@@ -87,7 +104,7 @@ if (fs.existsSync(CACHE_FILE)) {
     cache.fetchedAt = saved.fetchedAt;
     const ageMin = ((Date.now() - saved.fetchedAt) / 60000).toFixed(1);
     console.log(`[cache] loaded from disk — age ${ageMin} min`);
-  } catch { /* corrupt, will re-fetch */ }
+  } catch { /* corrupt file, will re-fetch */ }
 }
 
 if (!cache.launcher || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
