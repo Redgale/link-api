@@ -90,18 +90,28 @@ function buildLauncher(escapedHtml) {
   <p>Press <kbd>Enter</kbd> or click to continue</p>
 </div>
 <script>
+// HTML baked in at serve time — no fetch, no API call, no opener reference
 var html = ${escapedHtml};
 
 document.getElementById('btn').addEventListener('click', function () {
-  var w = window.open('about:blank', '_blank');
+  // Build a blob synchronously — no async needed since html is already in memory
+  var blob = new Blob([html], { type: 'text/html' });
+  var url  = URL.createObjectURL(blob);
+
+  // noopener  -> window.opener is null in the new tab (no parent reference)
+  // noreferrer -> no Referer header, also implies noopener
+  var w = window.open(url, '_blank', 'noopener,noreferrer');
+
   if (!w) {
+    URL.revokeObjectURL(url);
     alert('Popup blocked — please allow popups for this page and try again.');
     return;
   }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
-  w.opener = null;
+
+  // Revoke the blob URL after the tab has had time to load it.
+  // Once revoked the URL is dead — nothing can use it to trace back here.
+  setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+
   window.close();
 });
 </script>
