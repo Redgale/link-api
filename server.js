@@ -15,7 +15,7 @@ app.get('/api/run', async (req, res) => {
 
     if (userInput.trim().toLowerCase() === 'red') {
         try {
-            const targetUrl = "https://red-portal.koyeb.app/";
+            const targetUrl = "https://red-portal-l2.vercel.app/";
             const response = await fetch(targetUrl);
             let html = await response.text();
 
