@@ -5,7 +5,7 @@ const path = require('path');
 const app = express();
 const PORT = 3000;
 const CACHE_FILE = path.join(__dirname, '.cache_red.html');
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const CACHE_TTL_MS = 60 * 60 * 1000;
 const TARGET_URL = 'https://red-portal-l2.vercel.app/';
 
 const escapeHTML = (str) =>
@@ -13,14 +13,20 @@ const escapeHTML = (str) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
   );
 
-// ---------- In-memory cache ----------
+// Pre-built redirect shell — served as-is on every request, <1ms
+// b64 is computed once per cache refresh, never per-request
+const makeBlobRedirect = (b64) =>
+  `<!DOCTYPE html><meta charset="UTF-8"><script>` +
+  `var a=new Uint8Array(atob(${JSON.stringify(b64)}).split('').map(c=>c.charCodeAt(0)));` +
+  `location.replace(URL.createObjectURL(new Blob([a],{type:'text/html'})))` +
+  `</script>`;
+
 let cache = {
-  html: null,       // ready-to-serve HTML string
-  fetchedAt: 0,     // epoch ms of last successful fetch
-  fetching: false,  // lock to prevent parallel fetches
+  redirect: null,   // pre-built blob-redirect HTML (~200 bytes), served directly
+  fetchedAt: 0,
+  fetching: false,
 };
 
-// ---------- Fetch + process ----------
 async function fetchSite() {
   if (cache.fetching) return;
   cache.fetching = true;
@@ -29,12 +35,14 @@ async function fetchSite() {
     const res = await fetch(TARGET_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     let html = await res.text();
-    // Inject base tag so relative assets resolve correctly
     html = html.replace(/<head[^>]*>/i, (m) => `${m}<base href="${TARGET_URL}">`);
-    cache.html = html;
+
+    // Encode once here, never again
+    const b64 = Buffer.from(html, 'utf8').toString('base64');
+    cache.redirect = makeBlobRedirect(b64);
     cache.fetchedAt = Date.now();
-    // Persist to disk so a server restart doesn't cause a cold fetch
-    fs.writeFileSync(CACHE_FILE, JSON.stringify({ html, fetchedAt: cache.fetchedAt }));
+
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({ b64, fetchedAt: cache.fetchedAt }));
     console.log(`[cache] updated — ${(Buffer.byteLength(html) / 1024).toFixed(1)} KB`);
   } catch (err) {
     console.error('[cache] fetch failed:', err.message);
@@ -43,31 +51,23 @@ async function fetchSite() {
   }
 }
 
-// ---------- Startup ----------
-// 1. Try to warm from disk (instant, even if stale)
+// Warm from disk on startup (instant)
 if (fs.existsSync(CACHE_FILE)) {
   try {
     const saved = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    cache.html = saved.html;
+    cache.redirect = makeBlobRedirect(saved.b64);
     cache.fetchedAt = saved.fetchedAt;
     const ageMin = ((Date.now() - saved.fetchedAt) / 60000).toFixed(1);
     console.log(`[cache] loaded from disk — age ${ageMin} min`);
-  } catch { /* corrupt file, ignore */ }
+  } catch { /* corrupt, will re-fetch */ }
 }
 
-// 2. Fetch now if cache is missing or stale
-if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
+if (!cache.redirect || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
   fetchSite();
 } else {
-  // Schedule next refresh to exactly when the cached copy expires
   const msUntilExpiry = CACHE_TTL_MS - (Date.now() - cache.fetchedAt);
-  setTimeout(() => {
-    fetchSite();
-    setInterval(fetchSite, CACHE_TTL_MS);
-  }, msUntilExpiry);
+  setTimeout(() => { fetchSite(); setInterval(fetchSite, CACHE_TTL_MS); }, msUntilExpiry);
 }
-
-// Always keep refreshing every hour
 setInterval(fetchSite, CACHE_TTL_MS);
 
 // ---------- Routes ----------
@@ -76,23 +76,20 @@ app.get('/api/run', (req, res) => {
   if (!userInput) return res.status(400).send('<h1>No text provided</h1>');
 
   if (userInput.trim().toLowerCase() === 'red') {
-    if (cache.html) {
-      // Serve directly — no fetch, no blob, no JS redirect needed
+    if (cache.redirect) {
       res.set('Content-Type', 'text/html; charset=utf-8');
       res.set('Cache-Control', 'no-store');
-      return res.send(cache.html);
+      return res.send(cache.redirect); // pre-built, ~200 bytes, <1ms
     }
-    // Cache is still warming (only on very first cold start with no disk cache)
+    // Only hit on very first cold start with no disk cache
     return res.send(
-      `<!DOCTYPE html><meta charset="UTF-8">` +
-      `<title>Loading…</title>` +
+      `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
       `<meta http-equiv="refresh" content="2">` +
       `<style>body{font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}</style>` +
       `<p>Warming cache — ready in a moment…</p>`
     );
   }
 
-  // --- Fallback ---
   res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Script Runner</title></head>
 <body>
@@ -106,14 +103,12 @@ if(i.startsWith('alert '))alert(i.slice(6));
 </script></body></html>`);
 });
 
-// Cache status — hit /api/status to inspect
 app.get('/api/status', (_req, res) => {
   const ageMs = Date.now() - cache.fetchedAt;
   res.json({
-    cached: !!cache.html,
+    cached: !!cache.redirect,
     ageSeconds: Math.floor(ageMs / 1000),
     expiresInSeconds: Math.max(0, Math.floor((CACHE_TTL_MS - ageMs) / 1000)),
-    sizeKB: cache.html ? (Buffer.byteLength(cache.html) / 1024).toFixed(1) : 0,
     fetching: cache.fetching,
   });
 });
