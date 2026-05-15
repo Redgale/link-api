@@ -18,7 +18,7 @@ const escapeHTML = (str) =>
 const makeBlobRedirect = (b64) =>
   `<!DOCTYPE html><meta charset="UTF-8"><script>` +
   `var a=new Uint8Array(atob(${JSON.stringify(b64)}).split('').map(c=>c.charCodeAt(0)));` +
-  `location.replace(URL.createObjectURL(new Blob([a],{type:'text/html'})))` +
+  `var u=URL.createObjectURL(new Blob([a],{type:'text/html'}));window.open(u,'_blank');window.close()` +
   `</script>`;
 
 let cache = {
