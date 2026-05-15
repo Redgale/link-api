@@ -112,7 +112,7 @@ document.getElementById('btn').addEventListener('click', function () {
   }
 
   // Fetch raw HTML from server (this request comes from the LAUNCHER tab, not about:blank)
-  var RELAY = 'https://your-neutral-domain.vercel.app/relay.html';
+  var RELAY = 'https://extraordinary-blancmange-0dae6b.netlify.app/';
 
   fetch('/api/html')
     .then(function(r) {
