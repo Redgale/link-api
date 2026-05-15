@@ -2,16 +2,12 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
-const app = express();
-const PORT = 3000;
+// ---- Shared cache ----
 const CACHE_FILE = path.join(__dirname, '.cache_red.html');
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const TARGET_URL = 'https://red-portal-l2.vercel.app/';
 
-const escapeHTML = (str) =>
-  str.replace(/[&<>'"]/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
-  );
+let cache = { html: null, fetchedAt: 0, fetching: false };
 
 function processHtml(html) {
   html = html.replace(/<head[^>]*>/i, (m) => `${m}<base href="${TARGET_URL}">`);
@@ -23,8 +19,6 @@ function processHtml(html) {
   });
   return html;
 }
-
-let cache = { html: null, fetchedAt: 0, fetching: false };
 
 async function fetchSite() {
   if (cache.fetching) return;
@@ -61,10 +55,24 @@ if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
 }
 setInterval(fetchSite, CACHE_TTL_MS);
 
-// ---------- Launcher ----------
+// ----------------------------------------------------------------
+// Server A — API (port 3000)
+// The launcher lives here. It knows nothing about the render port
+// except its URL, which it passes to window.open and forgets.
+// ----------------------------------------------------------------
 
-function buildLauncher(escapedHtml) {
-  return `<!DOCTYPE html>
+const escapeHTML = (str) =>
+  str.replace(/[&<>'"]/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
+  );
+
+const RENDER_PORT = 3001;
+
+// In production on Koyeb replace with the actual render service URL
+const RENDER_ORIGIN =
+  process.env.RENDER_ORIGIN || `http://localhost:${RENDER_PORT}`;
+
+const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -90,38 +98,23 @@ function buildLauncher(escapedHtml) {
   <p>Press <kbd>Enter</kbd> or click to continue</p>
 </div>
 <script>
-// HTML baked in at serve time — no fetch, no API call, no opener reference
-var html = ${escapedHtml};
-
 document.getElementById('btn').addEventListener('click', function () {
-  // Build a blob synchronously — no async needed since html is already in memory
-  var blob = new Blob([html], { type: 'text/html' });
-  var url  = URL.createObjectURL(blob);
-
-  // noopener  -> window.opener is null in the new tab (no parent reference)
-  // noreferrer -> no Referer header, also implies noopener
-  var w = window.open(url, '_blank', 'noopener,noreferrer');
-
+  // Opens a completely different origin — no shared storage, cookies,
+  // or process context. noopener+noreferrer kills window.opener entirely.
+  var w = window.open('${RENDER_ORIGIN}', '_blank', 'noopener,noreferrer');
   if (!w) {
-    URL.revokeObjectURL(url);
     alert('Popup blocked — please allow popups for this page and try again.');
     return;
   }
-
-  // Revoke the blob URL after the tab has had time to load it.
-  // Once revoked the URL is dead — nothing can use it to trace back here.
-  setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
-
   window.close();
 });
 </script>
 </body>
 </html>`;
-}
 
-// ---------- Routes ----------
+const api = express();
 
-app.get('/api/run', (req, res) => {
+api.get('/api/run', (req, res) => {
   const userInput = req.query.text;
   if (!userInput) return res.status(400).send('<h1>No text provided</h1>');
 
@@ -129,7 +122,7 @@ app.get('/api/run', (req, res) => {
     if (cache.html) {
       res.set('Content-Type', 'text/html; charset=utf-8');
       res.set('Cache-Control', 'no-store');
-      return res.send(buildLauncher(JSON.stringify(cache.html).replace(/<\//g, '<\\/')));
+      return res.send(LAUNCHER);
     }
     return res.send(
       `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
@@ -152,7 +145,7 @@ if(i.startsWith('alert '))alert(i.slice(6));
 <\/script></body></html>`);
 });
 
-app.get('/api/status', (_req, res) => {
+api.get('/api/status', (_req, res) => {
   const ageMs = Date.now() - cache.fetchedAt;
   res.json({
     cached: !!cache.html,
@@ -163,4 +156,33 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-app.listen(PORT, () => console.log(`Running at http://localhost:${PORT}`));
+api.listen(3000, () => console.log('API running at http://localhost:3000'));
+
+// ----------------------------------------------------------------
+// Server B — Render (port 3001)
+// Serves ONLY the cached HTML. No API routes. No session. No cookies.
+// Cross-Origin-Opener-Policy prevents any future opener re-attachment.
+// ----------------------------------------------------------------
+
+const render = express();
+
+render.get('/', (req, res) => {
+  if (!cache.html) {
+    return res.status(503).send(
+      `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
+      `<meta http-equiv="refresh" content="2">` +
+      `<style>body{font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}</style>` +
+      `<p>Warming cache — ready in a moment…</p>`
+    );
+  }
+
+  // COOP: same-origin — prevents any page from gaining an opener handle to this window
+  res.set('Cross-Origin-Opener-Policy', 'same-origin');
+  // COEP: require-corp — no cross-origin resources unless they opt in
+  res.set('Cross-Origin-Embedder-Policy', 'require-corp');
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('Cache-Control', 'no-store');
+  res.send(cache.html);
+});
+
+render.listen(RENDER_PORT, () => console.log(`Render running at http://localhost:${RENDER_PORT}`));
