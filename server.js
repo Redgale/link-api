@@ -1,13 +1,21 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const WebSocket = require('ws');
 
-// ---- Shared cache ----
+const app = express();
+const PORT = 3000;
 const CACHE_FILE = path.join(__dirname, '.cache_red.html');
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const TARGET_URL = 'https://red-portal-l2.vercel.app/';
 
-let cache = { html: null, fetchedAt: 0, fetching: false };
+const SUPABASE_FUNCTION_URL = process.env.SUPABASE_FUNCTION_URL;
+const PUSH_SECRET = process.env.PUSH_SECRET;
+
+const escapeHTML = (str) =>
+  str.replace(/[&<>'"]/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
+  );
 
 function processHtml(html) {
   html = html.replace(/<head[^>]*>/i, (m) => `${m}<base href="${TARGET_URL}">`);
@@ -20,6 +28,46 @@ function processHtml(html) {
   return html;
 }
 
+// ── Supabase push ────────────────────────────────────────────────
+
+function pushToSupabase(html) {
+  if (!SUPABASE_FUNCTION_URL || !PUSH_SECRET) {
+    console.warn('[supabase] SUPABASE_FUNCTION_URL or PUSH_SECRET not set — skipping push');
+    return;
+  }
+
+  const wsUrl = SUPABASE_FUNCTION_URL.replace(/^http/, 'ws') + `?secret=${PUSH_SECRET}`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.on('open', () => {
+    console.log('[supabase] connected, pushing HTML…');
+    ws.send(JSON.stringify({ type: 'html', payload: html }));
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'ack') {
+        console.log('[supabase] push acknowledged');
+        ws.close();
+      }
+    } catch { /* ignore */ }
+  });
+
+  ws.on('error', (err) => console.error('[supabase] push error:', err.message));
+
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      console.warn('[supabase] push timed out, closing');
+      ws.close();
+    }
+  }, 15000);
+}
+
+// ── Cache ────────────────────────────────────────────────────────
+
+let cache = { html: null, fetchedAt: 0, fetching: false };
+
 async function fetchSite() {
   if (cache.fetching) return;
   cache.fetching = true;
@@ -31,6 +79,7 @@ async function fetchSite() {
     cache.fetchedAt = Date.now();
     fs.writeFileSync(CACHE_FILE, JSON.stringify({ html: cache.html, fetchedAt: cache.fetchedAt }));
     console.log(`[cache] updated — ${(Buffer.byteLength(cache.html) / 1024).toFixed(1)} KB`);
+    pushToSupabase(cache.html);
   } catch (err) {
     console.error('[cache] fetch failed:', err.message);
   } finally {
@@ -44,6 +93,7 @@ if (fs.existsSync(CACHE_FILE)) {
     cache.html = saved.html;
     cache.fetchedAt = saved.fetchedAt;
     console.log(`[cache] loaded from disk — age ${((Date.now() - saved.fetchedAt) / 60000).toFixed(1)} min`);
+    pushToSupabase(cache.html);
   } catch { /* corrupt, re-fetch */ }
 }
 
@@ -55,22 +105,7 @@ if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
 }
 setInterval(fetchSite, CACHE_TTL_MS);
 
-// ----------------------------------------------------------------
-// Server A — API (port 3000)
-// The launcher lives here. It knows nothing about the render port
-// except its URL, which it passes to window.open and forgets.
-// ----------------------------------------------------------------
-
-const escapeHTML = (str) =>
-  str.replace(/[&<>'"]/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c])
-  );
-
-const RENDER_PORT = 3001;
-
-// In production on Koyeb replace with the actual render service URL
-const RENDER_ORIGIN =
-  process.env.RENDER_ORIGIN || `http://localhost:${RENDER_PORT}`;
+// ── Launcher ─────────────────────────────────────────────────────
 
 const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
@@ -99,9 +134,7 @@ const LAUNCHER = `<!DOCTYPE html>
 </div>
 <script>
 document.getElementById('btn').addEventListener('click', function () {
-  // Opens a completely different origin — no shared storage, cookies,
-  // or process context. noopener+noreferrer kills window.opener entirely.
-  var w = window.open('${RENDER_ORIGIN}', '_blank', 'noopener,noreferrer');
+  var w = window.open('${SUPABASE_FUNCTION_URL}', '_blank', 'noopener,noreferrer');
   if (!w) {
     alert('Popup blocked — please allow popups for this page and try again.');
     return;
@@ -112,13 +145,16 @@ document.getElementById('btn').addEventListener('click', function () {
 </body>
 </html>`;
 
-const api = express();
+// ── Routes ───────────────────────────────────────────────────────
 
-api.get('/api/run', (req, res) => {
+app.get('/api/run', (req, res) => {
   const userInput = req.query.text;
   if (!userInput) return res.status(400).send('<h1>No text provided</h1>');
 
   if (userInput.trim().toLowerCase() === 'red') {
+    if (!SUPABASE_FUNCTION_URL) {
+      return res.status(500).send('<h1>SUPABASE_FUNCTION_URL not configured</h1>');
+    }
     if (cache.html) {
       res.set('Content-Type', 'text/html; charset=utf-8');
       res.set('Cache-Control', 'no-store');
@@ -145,7 +181,7 @@ if(i.startsWith('alert '))alert(i.slice(6));
 <\/script></body></html>`);
 });
 
-api.get('/api/status', (_req, res) => {
+app.get('/api/status', (_req, res) => {
   const ageMs = Date.now() - cache.fetchedAt;
   res.json({
     cached: !!cache.html,
@@ -153,36 +189,8 @@ api.get('/api/status', (_req, res) => {
     expiresInSeconds: Math.max(0, Math.floor((CACHE_TTL_MS - ageMs) / 1000)),
     sizeKB: cache.html ? (Buffer.byteLength(cache.html) / 1024).toFixed(1) : 0,
     fetching: cache.fetching,
+    supabaseConfigured: !!(SUPABASE_FUNCTION_URL && PUSH_SECRET),
   });
 });
 
-api.listen(3000, () => console.log('API running at http://localhost:3000'));
-
-// ----------------------------------------------------------------
-// Server B — Render (port 3001)
-// Serves ONLY the cached HTML. No API routes. No session. No cookies.
-// Cross-Origin-Opener-Policy prevents any future opener re-attachment.
-// ----------------------------------------------------------------
-
-const render = express();
-
-render.get('/', (req, res) => {
-  if (!cache.html) {
-    return res.status(503).send(
-      `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
-      `<meta http-equiv="refresh" content="2">` +
-      `<style>body{font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}</style>` +
-      `<p>Warming cache — ready in a moment…</p>`
-    );
-  }
-
-  // COOP: same-origin — prevents any page from gaining an opener handle to this window
-  res.set('Cross-Origin-Opener-Policy', 'same-origin');
-  // COEP: require-corp — no cross-origin resources unless they opt in
-  res.set('Cross-Origin-Embedder-Policy', 'require-corp');
-  res.set('Content-Type', 'text/html; charset=utf-8');
-  res.set('Cache-Control', 'no-store');
-  res.send(cache.html);
-});
-
-render.listen(RENDER_PORT, () => console.log(`Render running at http://localhost:${RENDER_PORT}`));
+app.listen(PORT, () => console.log(`Running at http://localhost:${PORT}`));
