@@ -28,11 +28,11 @@ function processHtml(html) {
   return html;
 }
 
-// ── Supabase push ────────────────────────────────────────────────
+// -- Supabase push --
 
 function pushToSupabase(html) {
   if (!SUPABASE_FUNCTION_URL || !PUSH_SECRET) {
-    console.warn('[supabase] SUPABASE_FUNCTION_URL or PUSH_SECRET not set — skipping push');
+    console.warn('[supabase] SUPABASE_FUNCTION_URL or PUSH_SECRET not set - skipping push');
     return;
   }
 
@@ -40,7 +40,7 @@ function pushToSupabase(html) {
   const ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
-    console.log('[supabase] connected, pushing HTML…');
+    console.log('[supabase] connected, pushing HTML...');
     ws.send(JSON.stringify({ type: 'html', payload: html }));
   });
 
@@ -64,7 +64,7 @@ function pushToSupabase(html) {
   }, 15000);
 }
 
-// ── Cache ────────────────────────────────────────────────────────
+// -- Cache --
 
 let cache = { html: null, fetchedAt: 0, fetching: false };
 
@@ -78,7 +78,7 @@ async function fetchSite() {
     cache.html = processHtml(await res.text());
     cache.fetchedAt = Date.now();
     fs.writeFileSync(CACHE_FILE, JSON.stringify({ html: cache.html, fetchedAt: cache.fetchedAt }));
-    console.log(`[cache] updated — ${(Buffer.byteLength(cache.html) / 1024).toFixed(1)} KB`);
+    console.log(`[cache] updated - ${(Buffer.byteLength(cache.html) / 1024).toFixed(1)} KB`);
     pushToSupabase(cache.html);
   } catch (err) {
     console.error('[cache] fetch failed:', err.message);
@@ -92,7 +92,7 @@ if (fs.existsSync(CACHE_FILE)) {
     const saved = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
     cache.html = saved.html;
     cache.fetchedAt = saved.fetchedAt;
-    console.log(`[cache] loaded from disk — age ${((Date.now() - saved.fetchedAt) / 60000).toFixed(1)} min`);
+    console.log(`[cache] loaded from disk - age ${((Date.now() - saved.fetchedAt) / 60000).toFixed(1)} min`);
     pushToSupabase(cache.html);
   } catch { /* corrupt, re-fetch */ }
 }
@@ -105,14 +105,14 @@ if (!cache.html || Date.now() - cache.fetchedAt > CACHE_TTL_MS) {
 }
 setInterval(fetchSite, CACHE_TTL_MS);
 
-// ── Launcher ─────────────────────────────────────────────────────
+// -- Launcher --
 
 const LAUNCHER = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Opening…</title>
+<title>Opening</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%;display:grid;place-items:center;background:#0f0f0f;font-family:system-ui,sans-serif}
@@ -129,14 +129,14 @@ const LAUNCHER = `<!DOCTYPE html>
 </head>
 <body>
 <div style="text-align:center">
-  <button id="btn" autofocus>Open ↗</button>
+  <button id="btn" autofocus>Open</button>
   <p>Press <kbd>Enter</kbd> or click to continue</p>
 </div>
 <script>
 document.getElementById('btn').addEventListener('click', function () {
   var w = window.open('${SUPABASE_FUNCTION_URL}', '_blank', 'noopener,noreferrer');
   if (!w) {
-    alert('Popup blocked — please allow popups for this page and try again.');
+    alert('Popup blocked - please allow popups for this page and try again.');
     return;
   }
   window.close();
@@ -145,7 +145,7 @@ document.getElementById('btn').addEventListener('click', function () {
 </body>
 </html>`;
 
-// ── Routes ───────────────────────────────────────────────────────
+// -- Routes --
 
 app.get('/api/run', (req, res) => {
   const userInput = req.query.text;
@@ -161,10 +161,10 @@ app.get('/api/run', (req, res) => {
       return res.send(LAUNCHER);
     }
     return res.send(
-      `<!DOCTYPE html><meta charset="UTF-8"><title>Loading…</title>` +
+      `<!DOCTYPE html><meta charset="UTF-8"><title>Loading</title>` +
       `<meta http-equiv="refresh" content="2">` +
       `<style>body{font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}</style>` +
-      `<p>Warming cache — ready in a moment…</p>`
+      `<p>Warming cache - ready in a moment</p>`
     );
   }
 
@@ -179,6 +179,16 @@ const i=${JSON.stringify(userInput)};
 document.getElementById('t').textContent='Ran at '+new Date().toLocaleTimeString();
 if(i.startsWith('alert '))alert(i.slice(6));
 <\/script></body></html>`);
+});
+
+app.get('/api/push', (req, res) => {
+  if (!cache.html) return res.status(503).json({ error: 'cache empty' });
+  try {
+    pushToSupabase(cache.html);
+    res.json({ ok: true, sizeKB: (Buffer.byteLength(cache.html) / 1024).toFixed(1) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/status', (_req, res) => {
